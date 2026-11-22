@@ -245,6 +245,13 @@ func (r *Repository) DeleteRoleGrants(ctx context.Context, roleId string, roleVe
 	if err != nil {
 		return db.NoRowsAffected, errors.Wrap(ctx, err, op)
 	}
+	if totalRowsDeleted > 0 {
+		r.emitRevocation(ctx, RevocationEvent{
+			RoleId:       roleId,
+			Grants:       grants,
+			ChangeReason: "grants-deleted",
+		})
+	}
 	return totalRowsDeleted, nil
 }
 

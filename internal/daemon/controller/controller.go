@@ -26,6 +26,7 @@ import (
 	credstatic "github.com/hashicorp/boundary/internal/credential/static"
 	"github.com/hashicorp/boundary/internal/credential/vault"
 	"github.com/hashicorp/boundary/internal/daemon/cluster"
+	controllerauth "github.com/hashicorp/boundary/internal/daemon/controller/auth"
 	"github.com/hashicorp/boundary/internal/daemon/controller/common"
 	"github.com/hashicorp/boundary/internal/daemon/controller/downstream"
 	"github.com/hashicorp/boundary/internal/daemon/controller/handlers/health"
@@ -41,6 +42,7 @@ import (
 	"github.com/hashicorp/boundary/internal/kms"
 	kmsjob "github.com/hashicorp/boundary/internal/kms/job"
 	"github.com/hashicorp/boundary/internal/pagination/purge"
+	"github.com/hashicorp/boundary/internal/perms"
 	"github.com/hashicorp/boundary/internal/plugin"
 	"github.com/hashicorp/boundary/internal/plugin/loopback"
 	"github.com/hashicorp/boundary/internal/ratelimit"
@@ -206,6 +208,20 @@ func New(ctx context.Context, conf *Config) (*Controller, error) {
 	if err := conf.RawConfig.Controller.InitNameIfEmpty(ctx); err != nil {
 		return nil, fmt.Errorf("error auto-generating controller name: %w", err)
 	}
+
+	// Resolve and pin the operator-selected scope composition policy. The
+	// config parser already validated the value; a missing block resolves to
+	// the union policy and preserves historical authorization behavior.
+	compositionWire := config.DefaultScopeComposition
+	if conf.RawConfig.Controller.Authorization != nil &&
+		conf.RawConfig.Controller.Authorization.ScopeComposition != "" {
+		compositionWire = conf.RawConfig.Controller.Authorization.ScopeComposition
+	}
+	compositionPolicy, err := perms.CompositionPolicyFromString(compositionWire)
+	if err != nil {
+		return nil, fmt.Errorf("invalid authorization scope composition policy: %w", err)
+	}
+	controllerauth.SetGlobalCompositionPolicy(compositionPolicy)
 
 	if !conf.RawConfig.DisableMlock {
 		// Ensure our memory usage is locked into physical RAM
@@ -412,8 +428,15 @@ func New(ctx context.Context, conf *Config) (*Controller, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error creating new scheduler: %w", err)
 	}
+	sessionRepoFactory := func() (*session.Repository, error) {
+		return session.NewRepository(ctx, dbase, dbase, c.kms)
+	}
+	revocationAdapter := newRevocationHookAdapter(sessionRepoFactory)
 	c.IamRepoFn = func() (*iam.Repository, error) {
-		return iam.NewRepository(ctx, dbase, dbase, c.kms, iam.WithRandomReader(c.conf.SecureRandomReader))
+		return iam.NewRepository(ctx, dbase, dbase, c.kms,
+			iam.WithRandomReader(c.conf.SecureRandomReader),
+			iam.WithRevocationHook(revocationAdapter),
+		)
 	}
 	c.StaticHostRepoFn = func() (*static.Repository, error) {
 		return static.NewRepository(ctx, dbase, dbase, c.kms)
@@ -630,7 +653,26 @@ func (c *Controller) registerJobs() error {
 	if err := pluginhost.RegisterJobs(c.baseContext, c.scheduler, rw, rw, c.kms, c.conf.HostPlugins); err != nil {
 		return err
 	}
-	if err := session.RegisterJobs(c.baseContext, c.scheduler, rw, rw, c.kms, c.workerRPCGracePeriod); err != nil {
+	reconcileInterval := config.DefaultRevocationReconcileInterval
+	if c.conf.RawConfig.Controller.Authorization != nil &&
+		c.conf.RawConfig.Controller.Authorization.RevocationReconcileIntervalDuration > 0 {
+		reconcileInterval = c.conf.RawConfig.Controller.Authorization.RevocationReconcileIntervalDuration
+	}
+	sessionRepo, err := session.NewRepository(c.baseContext, rw, rw, c.kms)
+	if err != nil {
+		return fmt.Errorf("error creating session repository for revocation jobs: %w", err)
+	}
+	if err := session.RegisterJobs(c.baseContext, c.scheduler, rw, rw, c.kms, c.workerRPCGracePeriod,
+		session.RevocationJobOptions{
+			Resolver: newLiveGrantResolver(c.IamRepoFn),
+			Canceller: func(ctx context.Context, sessionId string, _ session.TerminationReason) error {
+				// The repository records the authorization-revoked reason
+				// internally, so the reason argument is intentionally ignored.
+				return sessionRepo.CancelSessionForRevocation(ctx, sessionId)
+			},
+			RunInterval: reconcileInterval,
+		},
+	); err != nil {
 		return err
 	}
 	var serverJobOpts []serversjob.Option

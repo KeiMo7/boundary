@@ -17,8 +17,21 @@ import (
 
 const deleteTerminatedThreshold = time.Hour
 
+// RevocationJobOptions configures the authorization revocation reconciliation
+// job. When Resolver is nil the reconcile job is not registered, keeping
+// callers that only need the legacy connection/cleanup jobs unchanged.
+type RevocationJobOptions struct {
+	// Resolver returns a user's current authorization entries in snapshot
+	// vocabulary. The controller supplies an adapter over iam.GrantsForUser.
+	Resolver LiveGrantResolver
+	// Canceller invalidates a session; normally Repository.CancelSessionForRevocation.
+	Canceller SessionCanceller
+	// RunInterval is the fallback sweep interval.
+	RunInterval time.Duration
+}
+
 // RegisterJobs registers session related jobs with the provided scheduler.
-func RegisterJobs(ctx context.Context, scheduler *scheduler.Scheduler, w db.Writer, r db.Reader, k *kms.Kms, workerRPCGracePeriod *atomic.Int64) error {
+func RegisterJobs(ctx context.Context, scheduler *scheduler.Scheduler, w db.Writer, r db.Reader, k *kms.Kms, workerRPCGracePeriod *atomic.Int64, opt ...RevocationJobOptions) error {
 	const op = "session.RegisterJobs"
 
 	if workerRPCGracePeriod == nil {
@@ -43,6 +56,22 @@ func RegisterJobs(ctx context.Context, scheduler *scheduler.Scheduler, w db.Writ
 	}
 	if err = scheduler.RegisterJob(ctx, deleteTerminatedJob); err != nil {
 		return fmt.Errorf("error registering delete terminated session job: %w", err)
+	}
+
+	// Optionally register the authorization revocation reconciliation job.
+	// It is the fallback path that guarantees a session is invalidated within
+	// the configured lag even if the synchronous IAM hook is lost.
+	for _, o := range opt {
+		if o.Resolver == nil || o.Canceller == nil || o.RunInterval <= 0 {
+			continue
+		}
+		reconcileJob, err := newRevocationReconcileJob(ctx, repo, w, o.Resolver, o.Canceller, o.RunInterval)
+		if err != nil {
+			return fmt.Errorf("error creating revocation reconcile job: %w", err)
+		}
+		if err = scheduler.RegisterJob(ctx, reconcileJob); err != nil {
+			return fmt.Errorf("error registering revocation reconcile job: %w", err)
+		}
 	}
 
 	return nil

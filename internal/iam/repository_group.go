@@ -366,6 +366,16 @@ func (r *Repository) DeleteGroupMembers(ctx context.Context, groupId string, gro
 	if err != nil {
 		return db.NoRowsAffected, errors.Wrap(ctx, err, op)
 	}
+	if totalRowsDeleted > 0 {
+		// The group is the principal whose membership changed; snapshots reach
+		// roles through a membership path containing this group id, so the
+		// session-side selector can find affected users without enumerating
+		// them here.
+		r.emitRevocation(ctx, RevocationEvent{
+			PrincipalIds: append([]string{groupId}, userIds...),
+			ChangeReason: "group-members-removed",
+		})
+	}
 	return totalRowsDeleted, nil
 }
 
@@ -394,6 +404,7 @@ func (r *Repository) SetGroupMembers(ctx context.Context, groupId string, groupV
 
 	var currentMembers []*GroupMember
 	var totalRowsAffected int
+	var removedMemberIds []string
 	_, err = r.writer.DoTx(
 		ctx,
 		db.StdRetryCnt,
@@ -457,6 +468,9 @@ func (r *Repository) SetGroupMembers(ctx context.Context, groupId string, groupV
 				totalRowsAffected += rowsDeleted
 				msgs = append(msgs, userOplogMsgs...)
 				metadata["op-type"] = append(metadata["op-type"], oplog.OpType_OP_TYPE_DELETE.String())
+				for _, m := range deleteMembers {
+					removedMemberIds = append(removedMemberIds, m.GetMemberId())
+				}
 			}
 			if len(addMembers) > 0 {
 				userOplogMsgs := make([]*oplog.Message, 0, len(addMembers))
@@ -481,6 +495,12 @@ func (r *Repository) SetGroupMembers(ctx context.Context, groupId string, groupV
 		})
 	if err != nil {
 		return nil, db.NoRowsAffected, errors.Wrap(ctx, err, op)
+	}
+	if len(removedMemberIds) > 0 {
+		r.emitRevocation(ctx, RevocationEvent{
+			PrincipalIds: append([]string{groupId}, removedMemberIds...),
+			ChangeReason: "group-members-set",
+		})
 	}
 	return currentMembers, totalRowsAffected, nil
 }

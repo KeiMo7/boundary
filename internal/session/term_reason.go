@@ -22,6 +22,11 @@ const (
 	SystemError        TerminationReason = "system error"
 	ConnectionLimit    TerminationReason = "connection limit"
 	SessionCanceled    TerminationReason = "canceled"
+	// AuthorizationRevoked marks sessions invalidated because a role, grant
+	// or membership captured in the session's authorization snapshot was
+	// revoked, or because authorization data could not be re-verified and the
+	// conservative-deny fallback applied.
+	AuthorizationRevoked TerminationReason = "authorization revoked"
 )
 
 // String representation of the termination reason
@@ -46,6 +51,10 @@ func convertToReason(ctx context.Context, s string) (TerminationReason, error) {
 		return SystemError, nil
 	case ConnectionLimit.String():
 		return ConnectionLimit, nil
+	case ConnectionLimit.String():
+		return ConnectionLimit, nil
+	case AuthorizationRevoked.String():
+		return AuthorizationRevoked, nil
 	default:
 		return "", errors.New(ctx, errors.InvalidParameter, op, fmt.Sprintf("%s is not a valid reason", s))
 	}

@@ -84,6 +84,20 @@ func (r *Repository) CreateSession(ctx context.Context, sessionWrapper wrapping.
 				return errors.Wrap(ctx, err, op)
 			}
 
+			// Persist the authorization snapshot in the same transaction so a
+			// session can never exist without the point-in-time authorization
+			// needed for revocation reconciliation.
+			if newSession.AuthzSnapshot != nil {
+				newSession.AuthzSnapshot.SessionId = newSession.PublicId
+				snapRecord, snapErr := toRecord(ctx, newSession.AuthzSnapshot)
+				if snapErr != nil {
+					return errors.Wrap(ctx, snapErr, op)
+				}
+				if err = w.Create(ctx, snapRecord); err != nil {
+					return errors.Wrap(ctx, err, op, errors.WithMsg("failed to create authorization snapshot"))
+				}
+			}
+
 			if newSession.HostSetId != "" && newSession.HostId != "" {
 				hs, err := NewSessionHostSetHost(ctx, newSession.PublicId, newSession.HostSetId, newSession.HostId)
 				if err != nil {

@@ -342,6 +342,12 @@ func (r *Repository) DeleteRole(ctx context.Context, withPublicId string, _ ...O
 	if err != nil {
 		return db.NoRowsAffected, errors.Wrap(ctx, err, op, errors.WithMsg(fmt.Sprintf("failed for %s", withPublicId)))
 	}
+	if rowsDeleted > 0 {
+		r.emitRevocation(ctx, RevocationEvent{
+			RoleId:       withPublicId,
+			ChangeReason: "role-deleted",
+		})
+	}
 	return rowsDeleted, nil
 }
 

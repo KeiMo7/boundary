@@ -68,6 +68,10 @@ type ComposedOf struct {
 	ProtocolWorkerId string
 	// CorrelationId is the CorrelationId of the authorize-session request
 	CorrelationId string `json:"-" gorm:"default:null"`
+	// AuthzSnapshot is the point-in-time authorization captured for this
+	// session. When non-nil, CreateSession persists it in the same transaction
+	// as the session row. It is not a column on the session table itself.
+	AuthzSnapshot *AuthzSnapshot `gorm:"-"`
 }
 
 // Session contains information about a user's session with a target
@@ -143,6 +147,11 @@ type Session struct {
 	// CorrelationId is the CorrelationId of the authorize-session request
 	CorrelationId string `json:"-" gorm:"default:null"`
 
+	// AuthzSnapshot is the point-in-time authorization for this session. It is
+	// persisted to session_authz_snapshot in the CreateSession transaction
+	// rather than as a column on this table.
+	AuthzSnapshot *AuthzSnapshot `gorm:"-"`
+
 	tableName string `gorm:"-"`
 }
 
@@ -211,6 +220,7 @@ func New(ctx context.Context, c ComposedOf, _ ...Option) (*Session, error) {
 		StaticCredentials:   c.StaticCredentials,
 		ProtocolWorkerId:    c.ProtocolWorkerId,
 		CorrelationId:       c.CorrelationId,
+		AuthzSnapshot:       c.AuthzSnapshot,
 	}
 	if err := s.validateNewSession(ctx); err != nil {
 		return nil, errors.Wrap(ctx, err, op)
@@ -243,6 +253,7 @@ func (s *Session) Clone() any {
 		KeyId:               s.KeyId,
 		ProtocolWorkerId:    s.ProtocolWorkerId,
 		CorrelationId:       s.CorrelationId,
+		AuthzSnapshot:       s.AuthzSnapshot,
 	}
 	if len(s.States) > 0 {
 		clone.States = make([]*State, 0, len(s.States))

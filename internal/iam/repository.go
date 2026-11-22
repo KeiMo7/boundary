@@ -26,6 +26,11 @@ type Repository struct {
 
 	// defaultLimit provides a default for limiting the number of results returned from the repo
 	defaultLimit int
+
+	// revocationHook is notified after committed role/grant/membership
+	// mutations so permission revocation can propagate to live sessions. It
+	// defaults to a no-op and never blocks an IAM write.
+	revocationHook RevocationHook
 }
 
 // NewRepository creates a new iam Repository. Supports the options: WithLimit
@@ -46,11 +51,15 @@ func NewRepository(ctx context.Context, r db.Reader, w db.Writer, kms *kms.Kms, 
 		// zero signals the boundary defaults should be used.
 		opts.withLimit = db.DefaultLimit
 	}
+	if opts.withRevocationHook == nil {
+		opts.withRevocationHook = noopRevocationHook{}
+	}
 	return &Repository{
-		reader:       r,
-		writer:       w,
-		kms:          kms,
-		defaultLimit: opts.withLimit,
+		reader:         r,
+		writer:         w,
+		kms:            kms,
+		defaultLimit:   opts.withLimit,
+		revocationHook: opts.withRevocationHook,
 	}, nil
 }
 

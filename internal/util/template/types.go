@@ -9,6 +9,22 @@ package template
 type Data struct {
 	User    User
 	Account Account
+	// Session is populated when credentials are issued for an established
+	// session. It lets a credential library render a per-session, traceable
+	// target-side identity instead of a shared generic account.
+	Session Session
+}
+
+// Session contains session-scoped information available to credential
+// library templates. BoundaryPrincipal is a precomputed, filesystem-safe
+// identifier that encodes both the Boundary user and the session, so the
+// target host can attribute an action back to a specific authorized session.
+type Session struct {
+	// Id is the Boundary session public id (s_...).
+	Id *string
+	// BoundaryPrincipal is "bnd_<userId>_<shortSessionHash>"; it is stable for
+	// the life of one session and unique across sessions of the same user.
+	BoundaryPrincipal *string
 }
 
 // User contains user information. FullName and Email are not always populated

@@ -65,6 +65,52 @@ type key int
 
 var verifierKey key
 
+// compositionPolicyKey carries the operator-selected scope composition
+// policy separately from the verifier so the verifier constructor signature
+// stays stable. An absent value resolves to the union policy, preserving
+// historical behavior.
+var compositionPolicyKey key
+
+// globalCompositionPolicy is the process-wide policy selected by controller
+// configuration. It is set once at startup via SetGlobalCompositionPolicy and
+// read by every verifier, avoiding a signature change across the interceptor
+// stack. The zero value is union, so an unconfigured controller behaves
+// exactly as before.
+var globalCompositionPolicy = perms.UnionCompositionPolicy
+
+// SetGlobalCompositionPolicy selects the scope composition policy for all
+// subsequent authorization checks. It is intended to be called once during
+// controller startup from parsed configuration. Unknown values are ignored.
+func SetGlobalCompositionPolicy(p perms.CompositionPolicy) {
+	if p == perms.UnionCompositionPolicy || p == perms.IntersectionCompositionPolicy {
+		globalCompositionPolicy = p
+	}
+}
+
+// ActiveCompositionPolicy returns the currently selected process-wide scope
+// composition policy. It defaults to union when configuration is absent.
+func ActiveCompositionPolicy() perms.CompositionPolicy {
+	return globalCompositionPolicy
+}
+
+// NewCompositionPolicyContext returns a context that selects the scope
+// composition policy for authorization checks performed through it. The
+// controller interceptor sets this once from configuration.
+func NewCompositionPolicyContext(ctx context.Context, policy perms.CompositionPolicy) context.Context {
+	return context.WithValue(ctx, compositionPolicyKey, policy)
+}
+
+// compositionPolicyFromContext resolves the policy: a context-scoped override
+// wins, otherwise the process-wide configuration applies, defaulting to
+// union.
+func compositionPolicyFromContext(ctx context.Context) perms.CompositionPolicy {
+	if v, ok := ctx.Value(compositionPolicyKey).(perms.CompositionPolicy); ok &&
+		(v == perms.UnionCompositionPolicy || v == perms.IntersectionCompositionPolicy) {
+		return v
+	}
+	return globalCompositionPolicy
+}
+
 type VerifyResults struct {
 	UserData template.Data
 	// This is copied out from UserData above but used to avoid nil checks in
@@ -682,7 +728,8 @@ func (v verifier) performAuthCheck(ctx context.Context, resourceType []resource.
 	}
 
 	retAcl = perms.NewACL(parsedGrants...)
-	aclResults = retAcl.Allowed(*v.res, v.act, *userData.User.Id)
+	policy := compositionPolicyFromContext(v.ctx)
+	aclResults = retAcl.AllowedWithPolicy(*v.res, v.act, *userData.User.Id, policy)
 	// We don't set authenticated above because setting this but not authorized
 	// is used for further permissions checks, such as during recursive listing.
 	// So we want to make sure any code relying on that has the full set of
@@ -738,8 +785,9 @@ func (r *VerifyResults) fetchActions(id string, typ resource.Type, availableActi
 	}
 
 	ret := make(action.ActionSet, len(availableActions))
+	policy := compositionPolicyFromContext(r.v.ctx)
 	for act := range availableActions {
-		if r.v.acl.Allowed(*res, act, *r.UserData.User.Id).Authorized {
+		if r.v.acl.AllowedWithPolicy(*res, act, *r.UserData.User.Id, policy).Authorized {
 			ret.Add(act)
 		}
 	}
@@ -763,7 +811,7 @@ func (r *VerifyResults) FetchOutputFields(res perms.Resource, act action.Type) *
 		return ret
 	}
 
-	return r.v.acl.Allowed(res, act, *r.UserData.User.Id).OutputFields
+	return r.v.acl.AllowedWithPolicy(res, act, *r.UserData.User.Id, compositionPolicyFromContext(r.v.ctx)).OutputFields
 }
 
 // ACL returns the perms.ACL of the verifier.
@@ -953,6 +1001,13 @@ func (r *VerifyResults) ScopesAuthorizedForList(ctx context.Context, rootScopeId
 // GrantsHash returns a stable hash of all the grants in the verify results.
 func (r *VerifyResults) GrantsHash(ctx context.Context) ([]byte, error) {
 	return r.grants.GrantHash(ctx)
+}
+
+// GrantTuples returns the raw grant tuples loaded for the verified request.
+// The target handler uses them to build the session's authorization snapshot,
+// recording exactly which roles and grants justified the session.
+func (r *VerifyResults) GrantTuples() perms.GrantTuples {
+	return r.grants
 }
 
 // GetRequestInfo extracts the request info stored in the context, if it exists.

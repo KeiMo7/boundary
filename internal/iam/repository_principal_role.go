@@ -342,6 +342,25 @@ func (r *Repository) SetPrincipalRoles(ctx context.Context, roleId string, roleV
 	if err != nil {
 		return nil, db.NoRowsAffected, errors.Wrap(ctx, err, op)
 	}
+	if len(toSet.DeleteUserRoles) > 0 ||
+		len(toSet.DeleteGroupRoles) > 0 ||
+		len(toSet.DeleteManagedGroupRoles) > 0 {
+		removed := make([]string, 0, len(toSet.DeleteUserRoles)+len(toSet.DeleteGroupRoles)+len(toSet.DeleteManagedGroupRoles))
+		for _, ur := range toSet.DeleteUserRoles {
+			removed = append(removed, ur.PrincipalId)
+		}
+		for _, gr := range toSet.DeleteGroupRoles {
+			removed = append(removed, gr.PrincipalId)
+		}
+		for _, gr := range toSet.DeleteManagedGroupRoles {
+			removed = append(removed, gr.PrincipalId)
+		}
+		r.emitRevocation(ctx, RevocationEvent{
+			PrincipalIds: removed,
+			RoleId:       roleId,
+			ChangeReason: "principals-set",
+		})
+	}
 	return currentPrincipals, totalRowsAffected, nil
 }
 
@@ -490,6 +509,13 @@ func (r *Repository) DeletePrincipalRoles(ctx context.Context, roleId string, ro
 	)
 	if err != nil {
 		return db.NoRowsAffected, errors.Wrap(ctx, err, op)
+	}
+	if totalRowsDeleted > 0 {
+		r.emitRevocation(ctx, RevocationEvent{
+			PrincipalIds: principalIds,
+			RoleId:       roleId,
+			ChangeReason: "principals-removed",
+		})
 	}
 	return totalRowsDeleted, nil
 }

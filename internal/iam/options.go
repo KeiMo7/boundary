@@ -43,6 +43,7 @@ type options struct {
 	withReader                  db.Reader
 	withWriter                  db.Writer
 	withStartPageAfterItem      pagination.Item
+	withRevocationHook          RevocationHook
 }
 
 func getDefaultOptions() options {
@@ -53,6 +54,7 @@ func getDefaultOptions() options {
 		withLimit:           0,
 		withSkipVetForWrite: false,
 		withRecursive:       false,
+		withRevocationHook:  noopRevocationHook{},
 	}
 }
 

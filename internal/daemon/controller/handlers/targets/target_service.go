@@ -43,6 +43,7 @@ import (
 	"github.com/hashicorp/boundary/internal/types/scope"
 	"github.com/hashicorp/boundary/internal/types/subtypes"
 	"github.com/hashicorp/boundary/internal/util"
+	"github.com/hashicorp/boundary/internal/util/template"
 	"github.com/hashicorp/boundary/sdk/pbs/controller/api/resources/scopes"
 	pb "github.com/hashicorp/boundary/sdk/pbs/controller/api/resources/targets"
 	fm "github.com/hashicorp/boundary/version"
@@ -968,6 +969,39 @@ func (s Service) AuthorizeSession(ctx context.Context, req *pbs.AuthorizeSession
 
 	expTime := timestamppb.Now()
 	expTime.Seconds += int64(t.GetSessionMaxSeconds())
+
+	// Capture the point-in-time authorization. The grant tuples are the exact
+	// set that satisfied ACL.Allowed for this request, so persisting them gives
+	// revocation reconciliation a faithful baseline to compare against.
+	grantTuples := authResults.GrantTuples()
+	snapshotEntries := make([]session.AuthzSnapshotEntry, 0, len(grantTuples))
+	for _, gt := range grantTuples {
+		snapshotEntries = append(snapshotEntries, session.AuthzSnapshotEntry{
+			RoleId:            gt.RoleId,
+			RoleScopeId:       gt.RoleScopeId,
+			RoleParentScopeId: gt.RoleParentScopeId,
+			GrantScopeId:      gt.GrantScopeId,
+			Grant:             gt.Grant,
+			PrincipalId:       authResults.UserId,
+			PrincipalType:     session.PrincipalTypeUser,
+			MembershipPath:    []string{authResults.UserId},
+		})
+	}
+	scopePath := buildScopePath(authResults.Scope)
+	grantsHash, hashErr := authResults.GrantsHash(ctx)
+	if hashErr != nil {
+		return nil, errors.Wrap(ctx, hashErr, op, errors.WithMsg("failed to hash authorization grants for snapshot"))
+	}
+	authzSnapshot := &session.AuthzSnapshot{
+		UserId:            authResults.UserId,
+		AuthTokenId:       authResults.AuthTokenId,
+		ScopePath:         scopePath,
+		CompositionPolicy: compositionPolicyWire(),
+		GrantsHash:        grantsHash,
+		Entries:           snapshotEntries,
+		GrantsComplete:    len(snapshotEntries) > 0,
+	}
+
 	sessionComposition := session.ComposedOf{
 		UserId:              authResults.UserId,
 		HostId:              hostId,
@@ -985,6 +1019,7 @@ func (s Service) AuthorizeSession(ctx context.Context, req *pbs.AuthorizeSession
 		StaticCredentials:   staticCreds,
 		CorrelationId:       correlationId,
 		ProtocolWorkerId:    protoWorkerId,
+		AuthzSnapshot:       authzSnapshot,
 	}
 	sess, err := session.New(ctx, sessionComposition)
 	if err != nil {
@@ -1038,7 +1073,18 @@ func (s Service) AuthorizeSession(ctx context.Context, req *pbs.AuthorizeSession
 		if err != nil {
 			return nil, errors.Wrap(ctx, err, op)
 		}
-		dynamic, err = credRepo.Issue(ctx, sess.GetPublicId(), vaultReqs, credential.WithTemplateData(authResults.UserData))
+		// Expose a per-session, traceable principal to credential library
+		// templates so the target side sees an identity attributable to this
+		// user and session rather than only a generic shared account. The
+		// library opts in by referencing {{.Session.BoundaryPrincipal}} or
+		// {{.Session.Id}}; existing templates that ignore the fields are
+		// unaffected.
+		credentialTemplateData := authResults.UserData
+		credentialTemplateData.Session.Id = util.Pointer(sess.GetPublicId())
+		credentialTemplateData.Session.BoundaryPrincipal = util.Pointer(
+			template.BoundaryPrincipal(authResults.UserId, sess.GetPublicId()),
+		)
+		dynamic, err = credRepo.Issue(ctx, sess.GetPublicId(), vaultReqs, credential.WithTemplateData(credentialTemplateData))
 		if err != nil {
 			return nil, errors.Wrap(ctx, err, op)
 		}

@@ -319,6 +319,95 @@ type Controller struct {
 	// the environment variable BOUNDARY_CONTROLLER_CONCURRENT_PASSWORD_HASH_WORKERS.
 	ConcurrentPasswordHashWorkersRaw any  `hcl:"concurrent_password_hash_workers"`
 	ConcurrentPasswordHashWorkers    uint `hcl:"-"`
+
+	// Authorization configures the authorization engine semantics. An absent
+	// block resolves entirely to defaults, preserving historical behavior.
+	Authorization *Authorization `hcl:"authorization"`
+}
+
+// Default authorization tuning values. These are intentionally exported so
+// the controller and tests reference a single source of truth.
+const (
+	// DefaultScopeComposition is the historical grant-combination semantics.
+	DefaultScopeComposition = "union"
+	// DefaultRevocationReconcileInterval bounds how often the fallback
+	// revocation reconciliation job re-evaluates live sessions.
+	DefaultRevocationReconcileInterval = 30 * time.Second
+	// DefaultMaxRevocationSignalLag is the hard upper bound between a
+	// revocation event and an affected session becoming invalid even when the
+	// synchronous signal is lost.
+	DefaultMaxRevocationSignalLag = 60 * time.Second
+)
+
+// Authorization is the parsed `controller { authorization { ... } }` block.
+// The scope-composition policy is operator-selected rather than inferred by
+// the engine; see docs/authz-hardening/design.md.
+type Authorization struct {
+	// ScopeComposition selects how grants from multiple scope layers combine.
+	// Valid values are "union" (default) and "intersection".
+	ScopeComposition string `hcl:"scope_composition"`
+
+	// RevocationReconcileIntervalRaw / Duration mirror the repository's
+	// established any+duration parsing pattern.
+	RevocationReconcileIntervalRaw      any           `hcl:"revocation_reconcile_interval"`
+	RevocationReconcileIntervalDuration time.Duration `hcl:"-"`
+
+	// MaxRevocationSignalLagRaw / Duration bound the fail-closed window for
+	// revocation signals that never reach the controller synchronously.
+	MaxRevocationSignalLagRaw      any           `hcl:"max_revocation_signal_lag"`
+	MaxRevocationSignalLagDuration time.Duration `hcl:"-"`
+}
+
+// normalizeAuthorization fills defaults and validates the authorization
+// block. It is invoked from Parse so that an invalid policy fails startup
+// rather than being silently ignored at request time.
+func normalizeAuthorization(a *Authorization) error {
+	if a == nil {
+		return nil
+	}
+	if a.ScopeComposition == "" {
+		a.ScopeComposition = DefaultScopeComposition
+	}
+	switch a.ScopeComposition {
+	case "union", "intersection":
+	default:
+		return fmt.Errorf("authorization.scope_composition must be \"union\" or \"intersection\", got %q", a.ScopeComposition)
+	}
+
+	if a.RevocationReconcileIntervalRaw != nil {
+		d, err := parseutil.ParseDurationSecond(a.RevocationReconcileIntervalRaw)
+		if err != nil {
+			return fmt.Errorf("error parsing authorization.revocation_reconcile_interval: %w", err)
+		}
+		a.RevocationReconcileIntervalDuration = d
+	}
+	if a.RevocationReconcileIntervalDuration == 0 {
+		a.RevocationReconcileIntervalDuration = DefaultRevocationReconcileInterval
+	}
+	if a.RevocationReconcileIntervalDuration < 0 {
+		return errors.New("authorization.revocation_reconcile_interval cannot be negative")
+	}
+
+	if a.MaxRevocationSignalLagRaw != nil {
+		d, err := parseutil.ParseDurationSecond(a.MaxRevocationSignalLagRaw)
+		if err != nil {
+			return fmt.Errorf("error parsing authorization.max_revocation_signal_lag: %w", err)
+		}
+		a.MaxRevocationSignalLagDuration = d
+	}
+	if a.MaxRevocationSignalLagDuration == 0 {
+		a.MaxRevocationSignalLagDuration = DefaultMaxRevocationSignalLag
+	}
+	if a.MaxRevocationSignalLagDuration < 0 {
+		return errors.New("authorization.max_revocation_signal_lag cannot be negative")
+	}
+	// The fallback job must run at least as often as the failure window,
+	// otherwise the hard lag bound cannot be honored.
+	if a.RevocationReconcileIntervalDuration > a.MaxRevocationSignalLagDuration {
+		return fmt.Errorf("authorization.revocation_reconcile_interval (%s) must not exceed max_revocation_signal_lag (%s)",
+			a.RevocationReconcileIntervalDuration, a.MaxRevocationSignalLagDuration)
+	}
+	return nil
 }
 
 func (c *Controller) InitNameIfEmpty(ctx context.Context) error {
@@ -872,6 +961,10 @@ func Parse(d string) (*Config, error) {
 						reflect.TypeOf(t).String())
 				}
 			}
+		}
+
+		if err := normalizeAuthorization(result.Controller.Authorization); err != nil {
+			return nil, err
 		}
 
 		result.Controller.ApiRateLimits, err = parseApiRateLimits(obj.Node)
